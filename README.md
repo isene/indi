@@ -1,14 +1,24 @@
 # indi
 
-Telescope gear in the terminal. indi talks to an
-[INDI](https://indilib.org) server, the program that drives focusers,
-mounts, cameras and filter wheels, and shows every device it has.
+<img src="img/indi.svg" align="right" width="150">
+
+**Telescope gear in the terminal. Written in Rust.**
+
+![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+
+indi talks to an [INDI](https://indilib.org) server, the program that
+drives focusers, mounts, cameras and filter wheels, and shows every
+device it has.
 
 - The devices are on the left. A green dot means the device is connected.
-- On the right is the device you picked. A focuser or a mount gets a
-  control block at the top: the focuser's position, temperature and
-  saved positions, or where the mount points, how high, whether it
-  tracks, and its speed.
+- On the right is the device you picked. A focuser, a mount or a camera
+  gets a control block at the top: the focuser's position, temperature
+  and saved positions; where the mount points, how high, whether it
+  tracks, and its speed; or the camera's exposure and sensor.
+- A camera's pictures show below its block, stretched so the faint sky
+  shows, with the stars counted and their sharpness (HFR) measured. The
+  focuser's block shows the sharpest HFR so far and the position it was
+  taken at, which makes focusing a matter of making one number small.
 - Below that come all the device's settings, one group at a time, as
   its driver defines them. The dot before each one is grey when idle,
   green when fine, yellow when busy and red on trouble.
@@ -44,7 +54,7 @@ indi
 To try it without gear, use the simulators:
 
 ```bash
-indiserver indi_simulator_telescope indi_simulator_focus
+indiserver indi_simulator_telescope indi_simulator_focus indi_simulator_ccd
 ```
 
 `indi host` or `indi host:port` reaches a server on another machine,
@@ -101,6 +111,26 @@ The mount stops when you let go of an arrow in terminals that report
 key releases, such as kitty. In other terminals it moves until you
 press Space.
 
+In the camera's control block:
+
+| Key | What it does |
+|---|---|
+| Space | Takes a picture, or stops the one being taken |
+| e | Sets the exposure time in seconds |
+| + - | Doubles or halves the exposure time |
+| l | Takes pictures over and over; l again stops after this one |
+| z | Shows the middle of the picture pixel for pixel, for focusing |
+| s | Saves the picture as the FITS file the camera sent |
+| a | Saves every picture as it comes |
+| t | Cools the sensor to a temperature you type |
+| g | Sets the gain |
+| b | Steps the binning: 1×1, 2×2 and so on |
+
+Pictures are saved in `~/Pictures/indi`, named by the mount's target (or
+the camera) and the time: `M42_Orion_Nebula_2026-11-18T21-30-05.fits`.
+indi reads FITS pictures; a camera set to compress them shows a note
+instead.
+
 ## Settings
 
 indi keeps its settings in `~/.indirc` and rewrites the file when you
@@ -113,6 +143,8 @@ lon = 0.0
 drivers = indi_ieaf_focuser indi_eqmod_telescope
 focus1 = 31250 Visual
 focus2 = 30120 Camera
+exposure = 2
+pictures = ~/Pictures/indi
 ```
 
 `lat` and `lon` (east is positive) are used only when the mount does
@@ -134,6 +166,11 @@ cd indi && cargo build --release
 
 A thread reads the server and wakes the program only when something
 changes. With no key and no news from the gear, indi does no work.
+
+The server sends a camera's pictures only after the first exposure from
+indi, and a picture is drawn again only when it, its place or its
+colours change. A 26-megapixel picture takes about a fifth of a second
+to read, measure and draw.
 
 ## License
 

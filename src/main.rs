@@ -5,16 +5,18 @@
 //! one group at a time. A thread reads the server and wakes the key
 //! wait, so the program sleeps until a key or a change comes.
 
+mod camera;
 mod config;
 mod proto;
 mod sky;
 
+use camera::Frame;
 use config::Config;
 use crust::input::KeyState;
 use crust::{style, Crust, Input, Pane};
 use proto::{parse_number, show_number, Device, Element, Kind, Model, Parser, Prop};
 use sky::Target;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
@@ -31,7 +33,7 @@ With no server running, d picks drivers and starts one. Or start it
 yourself with the drivers for your gear, for example
   indiserver indi_ieaf_focuser indi_eqmod_telescope
 or, to try it without gear,
-  indiserver indi_simulator_telescope indi_simulator_focus
+  indiserver indi_simulator_telescope indi_simulator_focus indi_simulator_ccd
 
 Keys anywhere
   Tab          devices, control, settings
@@ -61,8 +63,15 @@ Mount
   g goes to a name (M42, Vega, Jupiter) or an RA and Dec
   s picks a star on a map of the sky, y syncs on a name
 
+Camera
+  Space takes a picture (or stops one), e sets the exposure time,
+  + - double or halve it, l takes pictures over and over,
+  s saves the picture, a saves every picture, z shows the middle
+  pixel for pixel, t cools the sensor, g sets the gain, b the binning
+
 Settings are in ~/.indirc: night, lat and lon (for when the mount
-does not know its site), drivers, and the focuser's saved positions.";
+does not know its site), drivers, the focuser's saved positions,
+the exposure time, and the folder for pictures (pictures).";
 
 /// Colours for day and for night. Night is all red, which keeps the
 /// eyes used to the dark.
@@ -86,11 +95,29 @@ const SUN_WARN: f64 = 15.0;
 /// Closer than this, indi will not go at all.
 const SUN_REFUSE: f64 = 2.0;
 
+/// The lines of a camera's control block, above its picture.
+const CAM_LINES: u16 = 4;
+
 /// What the reading thread hands over, marked with the connection it
 /// came from, so a closed one is not mistaken for the new one.
 enum Ev {
     El(u32, Element),
+    /// A camera's picture, read in the thread: a big one takes a while.
+    Frame(u32, String, Result<Frame, String>),
     Gone(u32, String),
+}
+
+/// Where a picture is on screen and how it was drawn: when nothing in
+/// it changes, the picture is not drawn again.
+#[derive(Clone, Copy, PartialEq)]
+struct Place {
+    seq: u32,
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+    zoom: bool,
+    night: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,6 +172,24 @@ struct App {
     held: Option<(String, Instant)>,
     /// Each focuser's temperatures as they came in.
     temps: HashMap<String, Vec<f64>>,
+    /// Each camera's last picture, with a number that grows per picture.
+    frames: HashMap<String, (u32, Frame)>,
+    seq: u32,
+    /// The cameras whose pictures the server was asked for.
+    blobs: HashSet<String>,
+    /// The camera taking pictures over and over.
+    looping: Option<String>,
+    /// Save every picture as it comes.
+    autosave: bool,
+    /// Show the middle of the picture pixel for pixel.
+    zoom: bool,
+    /// Each camera's star sharpness (HFR), picture by picture.
+    hfrs: HashMap<String, Vec<f64>>,
+    /// Focuser position and HFR for each picture with stars, to find the
+    /// sharpest position.
+    focus_log: Vec<(f64, f64)>,
+    img: Option<glow::Display>,
+    shown: Option<Place>,
     tx: Sender<Ev>,
     rx: Receiver<Ev>,
     wake: Option<crust::Wake>,
@@ -198,7 +243,7 @@ fn value_text(pal: &Pal, p: &Prop, i: usize) -> String {
         Kind::Light => style::fg(&e.value, state_col(pal, &e.value)),
         Kind::Number => parse_number(&e.value).map(|v| show_number(v, &e.format)).unwrap_or_else(|| e.value.clone()),
         Kind::Text => e.value.clone(),
-        Kind::Blob => style::dim("(data)"),
+        Kind::Blob => style::dim(if e.value.is_empty() { "(data)" } else { &e.value }),
     }
 }
 
@@ -271,7 +316,20 @@ fn connect(addr: &str, gen: u32, tx: Sender<Ev>, waker: Option<crust::Waker>) ->
                 wake();
                 return;
             }
-            for el in parser.feed(&buf[..n]) {
+            for mut el in parser.feed(&buf[..n]) {
+                // A picture is read here, and only its size goes on.
+                if el.name == "setBLOBVector" && el.attr("name") == Some("CCD1") {
+                    let dev = el.attr("device").unwrap_or("").to_string();
+                    for c in el.children.iter_mut().filter(|c| !c.text.trim().is_empty()) {
+                        let text = std::mem::take(&mut c.text);
+                        let format = c.attr("format").unwrap_or("").trim().to_string();
+                        let frame = Frame::from_blob(&text, &format);
+                        c.text = format!("{:.1} MB {format}", text.len() as f64 * 0.75 / 1e6);
+                        if tx.send(Ev::Frame(gen, dev.clone(), frame)).is_err() {
+                            return;
+                        }
+                    }
+                }
                 if tx.send(Ev::El(gen, el)).is_err() {
                     return;
                 }
@@ -310,6 +368,16 @@ impl App {
             target: None,
             held: None,
             temps: HashMap::new(),
+            frames: HashMap::new(),
+            seq: 0,
+            blobs: HashSet::new(),
+            looping: None,
+            autosave: false,
+            zoom: false,
+            hfrs: HashMap::new(),
+            focus_log: Vec::new(),
+            img: None,
+            shown: None,
             tx,
             rx,
             wake: crust::Wake::new(),
@@ -328,6 +396,7 @@ impl App {
     }
 
     fn layout(&mut self) {
+        self.hide_frame();
         let (cols, rows) = Crust::terminal_size();
         let rows = rows.max(6);
         let lw = 28.min(cols / 3).max(12);
@@ -351,6 +420,8 @@ impl App {
         self.group = 0;
         self.row = 0;
         self.seen = 0;
+        self.blobs.clear();
+        self.looping = None;
         let waker = self.wake.as_ref().map(|w| w.waker());
         match connect(&self.addr, self.gen, self.tx.clone(), waker) {
             Ok(s) => {
@@ -390,6 +461,16 @@ impl App {
                 self.model.apply(&el);
                 if watched {
                     self.after_set(&dev, &name, was.as_deref().unwrap_or(""));
+                }
+                true
+            }
+            Ev::Frame(g, dev, frame) if g == self.gen => {
+                match frame {
+                    Ok(f) => self.new_frame(dev, f),
+                    Err(e) => {
+                        self.looping = None;
+                        self.say(&e, self.pal.alert);
+                    }
                 }
                 true
             }
@@ -435,8 +516,12 @@ impl App {
         self.device().is_some_and(|d| d.is_mount())
     }
 
+    fn is_camera(&self) -> bool {
+        self.device().is_some_and(|d| d.is_camera())
+    }
+
     fn has_control(&self) -> bool {
-        self.device().is_some_and(|d| d.is_focuser() || d.is_mount())
+        self.device().is_some_and(|d| d.is_camera() || d.is_focuser() || d.is_mount())
     }
 
     /// Latitude and longitude: from a device that knows, else ~/.indirc.
@@ -450,7 +535,13 @@ impl App {
 
     /// Send new values for a property of the selected device.
     fn set(&mut self, prop: &str, values: Vec<(String, String)>) {
-        let Some(d) = self.device() else { return };
+        let Some(name) = self.device().map(|d| d.name.clone()) else { return };
+        self.set_on(&name, prop, values);
+    }
+
+    /// Send new values for a property of the device called `dev`.
+    fn set_on(&mut self, dev: &str, prop: &str, values: Vec<(String, String)>) {
+        let Some(d) = self.model.device(dev) else { return };
         let Some(p) = d.prop(prop) else {
             let t = format!("{} has no {prop}", d.name);
             self.say(&t, self.pal.alert);
@@ -608,6 +699,15 @@ impl App {
 
     fn render(&mut self) {
         self.clamp();
+        // A picture leaving or changing: the text under it is drawn anew,
+        // which in a terminal without pixels wipes the old one.
+        let want = self.frame_place();
+        if want != self.shown {
+            match want {
+                None => self.hide_frame(),
+                Some(_) => self.right.invalidate(),
+            }
+        }
         let pal = self.pal;
         let link = style::fg(&self.link, if self.net.is_some() { pal.ok } else { pal.alert });
         let night = if self.cfg.night { style::fg("   night", pal.accent) } else { String::new() };
@@ -642,6 +742,116 @@ impl App {
             },
         };
         self.foot.say(&crust::with_version(&text, self.foot.w as usize, "indi", VERSION));
+        if let Some(p) = want.filter(|p| Some(*p) != self.shown) {
+            self.show_frame(p);
+        }
+    }
+
+    // ─────────────────────────── the picture ─────────────────────────
+
+    /// Where the selected camera's picture goes: below its control
+    /// block, while the settings are not in use.
+    fn frame_place(&self) -> Option<Place> {
+        if self.view != View::Device || self.focus == Focus::Props {
+            return None;
+        }
+        let d = self.device().filter(|d| d.is_camera())?;
+        let (seq, _) = self.frames.get(&d.name)?;
+        let top = CAM_LINES + 2;
+        let rows = self.right.h.saturating_sub(top);
+        let cols = self.right.w.saturating_sub(2);
+        if rows < 3 || cols < 8 {
+            return None;
+        }
+        Some(Place { seq: *seq, x: self.right.x + 1, y: self.right.y + top, cols, rows, zoom: self.zoom, night: self.cfg.night })
+    }
+
+    fn show_frame(&mut self, p: Place) {
+        let Some(name) = self.device().map(|d| d.name.clone()) else { return };
+        let Some((_, f)) = self.frames.get(&name) else { return };
+        let (bw, bh) = glow::cell_box(p.cols, p.rows);
+        let cell = (bw as f64 / p.cols as f64, bh as f64 / p.rows as f64);
+        let (cols, rows) = f.fit(p.cols, p.rows, cell, p.zoom);
+        let mut canvas = glow::Canvas::new(cols, rows);
+        f.paint(&mut canvas, p.zoom, p.night);
+        self.img.get_or_insert_with(glow::Display::new).swap_canvas(&canvas, p.x, p.y);
+        self.shown = Some(p);
+    }
+
+    /// Take the picture off the screen, before other text or another
+    /// program takes its place.
+    fn hide_frame(&mut self) {
+        if self.shown.take().is_some() {
+            if let Some(img) = self.img.as_mut() {
+                img.drop_canvas();
+            }
+            self.right.invalidate();
+        }
+    }
+
+    fn new_frame(&mut self, dev: String, f: Frame) {
+        if let Some(h) = f.hfr {
+            let v = self.hfrs.entry(dev.clone()).or_default();
+            v.push(h);
+            if v.len() > 40 {
+                v.remove(0);
+            }
+            let pos = self.model.devices.iter().find_map(|d| d.prop("ABS_FOCUS_POSITION")?.num("FOCUS_ABSOLUTE_POSITION"));
+            if let Some(pos) = pos {
+                self.focus_log.push((pos, h));
+            }
+        }
+        self.seq += 1;
+        self.frames.insert(dev.clone(), (self.seq, f));
+        if self.autosave {
+            self.save_frame(&dev);
+        }
+        if self.looping.as_deref() == Some(dev.as_str()) {
+            self.expose(&dev);
+        }
+    }
+
+    /// Start an exposure. The first one asks the server for the
+    /// camera's pictures, which it does not send unasked.
+    fn expose(&mut self, dev: &str) {
+        if self.blobs.insert(dev.to_string()) {
+            self.send(proto::enable_blob(dev));
+        }
+        let secs = self.cfg.exposure.to_string();
+        self.set_on(dev, "CCD_EXPOSURE", vec![("CCD_EXPOSURE_VALUE".into(), secs)]);
+    }
+
+    fn exposing(&self) -> bool {
+        self.device().and_then(|d| d.prop("CCD_EXPOSURE")).is_some_and(|p| p.state == "Busy")
+    }
+
+    /// Save a camera's last picture as the FITS file it came as, named
+    /// by the target (or the camera) and the time it was taken.
+    fn save_frame(&mut self, dev: &str) {
+        let Some((_, f)) = self.frames.get(dev) else {
+            return self.say("no picture yet; Space takes one", self.pal.grey);
+        };
+        let dir = self.cfg.pictures_dir();
+        let stamp = f.date.clone().unwrap_or_else(|| {
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            secs.to_string()
+        });
+        let what = self.target.as_deref().unwrap_or(dev);
+        let base: String = format!("{what}_{stamp}")
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else if c == ':' { '-' } else { '_' })
+            .collect();
+        let mut path = dir.join(format!("{base}.fits"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("{base}_{n}.fits"));
+            n += 1;
+        }
+        let res = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &f.bytes));
+        match res {
+            Ok(()) => self.say(&format!("saved {}", path.display()), self.pal.ok),
+            Err(e) => self.say(&format!("could not save in {}: {e}", dir.display()), self.pal.alert),
+        }
     }
 
     fn title(&self, t: &str, f: Focus) -> String {
@@ -661,6 +871,9 @@ impl App {
             (View::Drivers, _) => " ↑↓ driver · Space tick · Enter start the server · Esc back",
             (View::Log | View::Help, _) => " Esc back · q quit",
             (_, Focus::Devices) => " ↑↓ device · Enter connect · Tab on · d drivers · n night · ? help · q quit",
+            (_, Focus::Control) if self.is_camera() => {
+                " Space expose · e time · + - longer, shorter · l loop · s save · a save all · z zoom · t cool · g gain · b bin"
+            }
             (_, Focus::Control) if self.is_mount() => {
                 " hold ↑↓←→ move · Space stop · g go to · s sky · y sync · + - speed · t track · p park"
             }
@@ -713,7 +926,15 @@ impl App {
         let h = self.right.h as usize;
         let Some(d) = self.device() else { return self.empty_lines() };
         let mut out = Vec::new();
-        if d.is_focuser() {
+        if d.is_camera() {
+            out.push(self.title(&format!("Camera · {}", d.name), Focus::Control));
+            out.extend(self.camera_lines(d));
+            out.push(String::new());
+            // The picture fills the rest.
+            if self.frame_place().is_some() {
+                return out;
+            }
+        } else if d.is_focuser() {
             out.push(self.title(&format!("Focuser · {}", d.name), Focus::Control));
             out.extend(self.focuser_lines(d));
             out.push(String::new());
@@ -792,6 +1013,16 @@ impl App {
             let trend = self.temps.get(&d.name).filter(|v| v.len() > 1).map(|v| sparkline(v)).unwrap_or_default();
             out.push(format!("   Temperature {t:.1} °C   {}", style::fg(&trend, pal.accent)));
         }
+        if let Some(&(_, now)) = self.focus_log.last() {
+            let best = self.focus_log.iter().cloned().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((0.0, now));
+            let trend: Vec<f64> = self.focus_log.iter().rev().take(40).rev().map(|x| x.1).collect();
+            out.push(format!(
+                "   Stars HFR {now:.2} px · sharpest {:.2} at {:.0}   {}",
+                best.1,
+                best.0,
+                style::fg(&sparkline(&trend), pal.accent)
+            ));
+        }
         let saved: Vec<String> = self.cfg.presets.iter().enumerate().filter_map(|(i, p)| {
             p.as_ref().map(|(pos, name)| format!("{} {} {pos:.0}", style::fg(&(i + 1).to_string(), pal.accent), name))
         }).collect();
@@ -799,6 +1030,81 @@ impl App {
             out.push(format!("   {}", saved.join("   ")));
         }
         out
+    }
+
+    /// The camera's control block: always CAM_LINES lines, so the
+    /// picture below does not move.
+    fn camera_lines(&self, d: &Device) -> Vec<String> {
+        let pal = &self.pal;
+        let mut out = Vec::new();
+        let mut l = format!("   Exposure {}", style::bold(&format!("{} s", self.cfg.exposure)));
+        if let Some(p) = d.prop("CCD_EXPOSURE").filter(|p| p.state == "Busy") {
+            let left = p.num("CCD_EXPOSURE_VALUE").map(|v| format!(", {v:.1} s left")).unwrap_or_default();
+            l.push_str(&style::fg(&format!("   exposing{left}"), pal.busy));
+        } else if d.prop("CCD_EXPOSURE").is_some_and(|p| p.state == "Alert") {
+            l.push_str(&style::fg("   the exposure failed", pal.alert));
+        }
+        let mut modes = Vec::new();
+        if self.looping.as_deref() == Some(d.name.as_str()) {
+            modes.push("over and over");
+        }
+        if self.autosave {
+            modes.push("saving each picture");
+        }
+        if self.zoom {
+            modes.push("middle, pixel for pixel");
+        }
+        if !modes.is_empty() {
+            l.push_str(&style::fg(&format!("   {}", modes.join(" · ")), pal.accent));
+        }
+        out.push(l);
+        let mut sensor = Vec::new();
+        if let Some(t) = d.prop("CCD_TEMPERATURE").and_then(|p| p.num("CCD_TEMPERATURE_VALUE")) {
+            sensor.push(format!("sensor {t:.1} °C"));
+        }
+        if let Some(p) = d.prop("CCD_COOLER") {
+            let power = d.prop("CCD_COOLER_POWER").and_then(|p| p.elems.first().and_then(|e| parse_number(&e.value)));
+            sensor.push(match (p.on("COOLER_ON"), power) {
+                (true, Some(w)) => style::fg(&format!("cooler {w:.0}%"), pal.ok),
+                (true, None) => style::fg("cooler on", pal.ok),
+                _ => "cooler off".to_string(),
+            });
+        }
+        if let Some(g) = self.gain_elem().and_then(|(p, e)| d.prop(&p)?.num(&e)) {
+            sensor.push(format!("gain {g:.0}"));
+        }
+        if let Some(b) = d.prop("CCD_BINNING").and_then(|p| Some((p.num("HOR_BIN")?, p.num("VER_BIN")?))) {
+            sensor.push(format!("bin {:.0}×{:.0}", b.0, b.1));
+        }
+        out.push(if sensor.is_empty() { String::new() } else { format!("   {}", sensor.join(" · ")) });
+        match self.frames.get(&d.name) {
+            Some((_, f)) => {
+                out.push(format!("   {}", f.facts()));
+                let when = f.date.as_deref().and_then(|t| t.get(11..19)).map(|t| format!("   taken {t}")).unwrap_or_default();
+                let stars = match f.hfr {
+                    Some(h) => {
+                        let trend = self.hfrs.get(&d.name).filter(|v| v.len() > 1).map(|v| sparkline(v)).unwrap_or_default();
+                        format!("{} stars · HFR {h:.2} px   {}", f.stars, style::fg(&trend, pal.accent))
+                    }
+                    None => "no stars found".to_string(),
+                };
+                out.push(format!("   {stars}{}", style::dim(&when)));
+            }
+            None => {
+                out.push(style::dim("   Space takes a picture"));
+                out.push(String::new());
+            }
+        }
+        out
+    }
+
+    /// The gain setting, by the name this driver gives it.
+    fn gain_elem(&self) -> Option<(String, String)> {
+        let d = self.device()?;
+        if d.prop("CCD_GAIN").is_some_and(|p| p.elem("GAIN").is_some()) {
+            return Some(("CCD_GAIN".into(), "GAIN".into()));
+        }
+        d.prop("CCD_CONTROLS").filter(|p| p.elem("Gain").is_some()).map(|_| ("CCD_CONTROLS".into(), "Gain".into()))
     }
 
     fn mount_lines(&self, d: &Device) -> Vec<String> {
@@ -865,7 +1171,7 @@ impl App {
             out.push(String::new());
             out.push(" To try it without gear:".into());
             out.push(String::new());
-            out.push(style::fg("   indiserver indi_simulator_telescope indi_simulator_focus", a));
+            out.push(style::fg("   indiserver indi_simulator_telescope indi_simulator_focus indi_simulator_ccd", a));
         }
         out
     }
@@ -901,6 +1207,7 @@ impl App {
             "C-A" => self.claude(),
             _ => match self.focus {
                 Focus::Devices => self.device_key(k),
+                Focus::Control if self.is_camera() => self.camera_key(k),
                 Focus::Control if self.is_mount() => self.mount_key(k),
                 Focus::Control => self.focuser_key(k),
                 Focus::Props => self.prop_key(k),
@@ -1000,6 +1307,10 @@ impl App {
             if let Some(t) = &self.target {
                 s.push_str(&format!("Last go-to target: {t}\n"));
             }
+            if let Some((_, f)) = self.frames.get(&d.name) {
+                let hfr = f.hfr.map(|h| format!(", median HFR {h:.2} px")).unwrap_or_default();
+                s.push_str(&format!("Last picture: {}; {} stars found{hfr}\n", f.facts(), f.stars));
+            }
             for p in &d.props {
                 s.push_str(&format!("\n[{}] {} ({}) state {}, {}\n", p.group, p.label, p.name, p.state, p.perm));
                 for e in &p.elems {
@@ -1016,6 +1327,7 @@ impl App {
     }
 
     fn claude(&mut self) {
+        self.hide_frame();
         let ctx = self.claude_context();
         Crust::disable_modifier_keys();
         let started = crust::claude_session(
@@ -1125,6 +1437,95 @@ impl App {
 
     fn yes(&mut self, prompt: &str) -> bool {
         self.ask(prompt, "").is_some_and(|a| a.eq_ignore_ascii_case("y"))
+    }
+
+    // ─────────────────────────── the camera ──────────────────────────
+
+    fn camera_key(&mut self, k: &str) {
+        let Some(dev) = self.device().map(|d| d.name.clone()) else { return };
+        match k {
+            " " if self.exposing() => {
+                self.looping = None;
+                self.pick("CCD_ABORT_EXPOSURE", "ABORT");
+                self.say("stopped the exposure", self.pal.busy);
+            }
+            " " => self.expose(&dev),
+            "e" => {
+                let now = self.cfg.exposure.to_string();
+                let Some(t) = self.ask(" Exposure in seconds: ", &now) else { return };
+                match t.parse::<f64>() {
+                    Ok(v) if v > 0.0 => self.set_exposure(v),
+                    _ => self.say(&format!("{t} is not a number of seconds"), self.pal.alert),
+                }
+            }
+            "+" => self.set_exposure(self.cfg.exposure * 2.0),
+            "-" => self.set_exposure(self.cfg.exposure / 2.0),
+            "l" if self.looping.as_deref() == Some(dev.as_str()) => {
+                self.looping = None;
+                self.say("the picture now taking is the last", self.pal.grey);
+            }
+            "l" => {
+                self.looping = Some(dev.clone());
+                if !self.exposing() {
+                    self.expose(&dev);
+                }
+            }
+            "s" => self.save_frame(&dev),
+            "a" => {
+                self.autosave = !self.autosave;
+                let t = if self.autosave {
+                    format!("each picture is saved in {}", self.cfg.pictures_dir().display())
+                } else {
+                    "pictures are saved only with s".to_string()
+                };
+                self.say(&t, self.pal.ok);
+            }
+            "z" => self.zoom = !self.zoom,
+            "t" => {
+                let Some(p) = self.device().and_then(|d| d.prop("CCD_TEMPERATURE")) else {
+                    return self.say("this camera has no cooler", self.pal.grey);
+                };
+                let now = p.num("CCD_TEMPERATURE_VALUE").map(|v| format!("{v:.0}")).unwrap_or_default();
+                let Some(t) = self.ask(" Cool the sensor to (°C): ", &now) else { return };
+                match parse_number(&t) {
+                    Some(v) => self.set("CCD_TEMPERATURE", vec![("CCD_TEMPERATURE_VALUE".into(), v.to_string())]),
+                    None => self.say(&format!("{t} is not a temperature"), self.pal.alert),
+                }
+            }
+            "g" => {
+                let Some((prop, elem)) = self.gain_elem() else {
+                    return self.say("this camera has no gain setting", self.pal.grey);
+                };
+                let now = self.device().and_then(|d| d.prop(&prop)?.num(&elem)).map(|v| format!("{v:.0}")).unwrap_or_default();
+                let Some(t) = self.ask(" Gain: ", &now) else { return };
+                match parse_number(&t) {
+                    Some(v) => self.set(&prop, vec![(elem, v.to_string())]),
+                    None => self.say(&format!("{t} is not a gain"), self.pal.alert),
+                }
+            }
+            "b" => {
+                let Some(p) = self.device().and_then(|d| d.prop("CCD_BINNING")) else {
+                    return self.say("this camera does not bin", self.pal.grey);
+                };
+                let now = p.num("HOR_BIN").unwrap_or(1.0);
+                let max = p.elem("HOR_BIN").map(|e| e.max).filter(|m| *m >= 1.0).unwrap_or(4.0);
+                let to = if now + 1.0 > max { 1.0 } else { now + 1.0 };
+                self.set("CCD_BINNING", vec![("HOR_BIN".into(), to.to_string()), ("VER_BIN".into(), to.to_string())]);
+            }
+            _ => {}
+        }
+    }
+
+    /// A new exposure time, kept inside what the camera takes and saved.
+    fn set_exposure(&mut self, v: f64) {
+        let range = self.device().and_then(|d| d.prop("CCD_EXPOSURE")?.elem("CCD_EXPOSURE_VALUE").map(|e| (e.min, e.max)));
+        let v = match range {
+            Some((lo, hi)) if hi > lo => v.clamp(lo, hi),
+            _ => v,
+        };
+        // Short times keep three figures, so halving 1 s gives 0.5, 0.25, 0.125.
+        self.cfg.exposure = if v < 1.0 { format!("{v:.3}").parse().unwrap_or(v) } else { (v * 10.0).round() / 10.0 };
+        self.cfg.save();
     }
 
     // ─────────────────────────── the focuser ─────────────────────────
@@ -1270,6 +1671,7 @@ impl App {
 
     /// The sky over the site as a map; the star picked is the target.
     fn sky_pick(&mut self) {
+        self.hide_frame();
         let jd = sky::now_jd();
         let proj = match self.site() {
             Some((lat, lon)) => starmap::Projection::Horizon { lst_deg: starmap::lst_deg(jd, lon), lat_deg: lat },
@@ -1350,6 +1752,7 @@ impl App {
     /// Before quitting: a mount left moving keeps moving after the
     /// program ends, and a server indi started ends with it.
     fn quit(&mut self) {
+        self.hide_frame();
         let mut sent = false;
         for i in 0..self.model.devices.len() {
             let d = &self.model.devices[i];

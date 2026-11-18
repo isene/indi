@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 (2026-11-18)
+
+- A camera gets a control block, and its pictures show below it: real
+  pixels where the terminal shows images, half blocks elsewhere.
+- Each picture is stretched so the faint sky shows, and measured: size,
+  lowest, middle and highest value, the stars found and their HFR (how
+  sharp they are).
+- The focuser's block shows the HFR of the last picture, the sharpest
+  so far and the focuser position it was taken at.
+- Space takes a picture or stops one, `l` takes them over and over, `z`
+  shows the middle pixel for pixel, `s` saves the picture as FITS and
+  `a` saves every one. `e`, `+` and `-` set the exposure, `t` cools the
+  sensor, `g` sets the gain and `b` the binning.
+- Raw colour sensors show in colour, and night colours show the picture
+  in red.
+- The server sends pictures only after the first exposure from indi, so
+  a camera left alone costs nothing.
+
 ## 0.1.0 (2026-11-18)
 
 - First version: the devices on an INDI server, a control block for a

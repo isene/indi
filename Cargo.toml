@@ -1,6 +1,6 @@
 [package]
 name = "indi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Telescope gear through an INDI server, in the terminal: a focuser, a mount and every property their drivers have"
@@ -9,6 +9,7 @@ repository = "https://github.com/isene/indi"
 
 [dependencies]
 crust = { version = "0.1.79", path = "../crust", package = "fe2o3-crust" }
+glow = { version = "0.1.53", path = "../glow", package = "fe2o3-glow" }
 orbit = { version = "0.2.0", path = "../orbit", package = "fe2o3-orbit" }
 starmap = { version = "0.1.12", path = "../starmap", package = "fe2o3-starmap" }
 

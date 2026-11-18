@@ -211,9 +211,10 @@ dependencies = [
 
 [[package]]
 name = "indi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fe2o3-crust",
+ "fe2o3-glow",
  "fe2o3-orbit",
  "fe2o3-starmap",
 ]

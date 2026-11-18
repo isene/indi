@@ -3,8 +3,8 @@
 //! The server sends `def…Vector` once for each property a driver has,
 //! `set…Vector` each time values change, `delProperty` when one goes,
 //! and `message` for news. The client sends `getProperties` once, then
-//! `new…Vector` to change something. Nothing else is needed here: BLOBs
-//! (camera pictures) stay off, which is the server's default.
+//! `new…Vector` to change something. BLOBs (camera pictures) stay off,
+//! the server's default, until `enable_blob` asks for a camera's.
 
 /// One XML element with what it holds.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -35,7 +35,16 @@ impl Parser {
         let mut done = Vec::new();
         let mut pos = 0;
         loop {
-            let Some(lt) = self.buf[pos..].iter().position(|&b| b == b'<').map(|i| pos + i) else { break };
+            let Some(lt) = self.buf[pos..].iter().position(|&b| b == b'<').map(|i| pos + i) else {
+                // A picture's base64 text can be tens of megabytes: it goes
+                // into its element as it comes, not into the buffer until
+                // its end tag. Base64 has no entities to cut in half.
+                if let Some(top) = self.stack.last_mut().filter(|t| t.name == "oneBLOB") {
+                    top.text.push_str(&String::from_utf8_lossy(&self.buf[pos..]));
+                    pos = self.buf.len();
+                }
+                break;
+            };
             let Some(gt) = tag_end(&self.buf, lt) else { break };
             if let Some(top) = self.stack.last_mut() {
                 top.text.push_str(&unescape(&String::from_utf8_lossy(&self.buf[pos..lt])));
@@ -254,6 +263,10 @@ impl Device {
         self.prop("ABS_FOCUS_POSITION").is_some() || self.prop("REL_FOCUS_POSITION").is_some()
     }
 
+    pub fn is_camera(&self) -> bool {
+        self.prop("CCD_EXPOSURE").is_some()
+    }
+
     pub fn is_mount(&self) -> bool {
         self.prop("EQUATORIAL_EOD_COORD").is_some()
     }
@@ -374,6 +387,12 @@ impl Model {
 
 pub fn get_properties() -> String {
     "<getProperties version=\"1.7\"/>\n".to_string()
+}
+
+/// Ask the server to send a camera's pictures (its main chip, `CCD1`)
+/// along with everything else.
+pub fn enable_blob(device: &str) -> String {
+    format!("<enableBLOB device=\"{}\" name=\"CCD1\">Also</enableBLOB>\n", escape(device))
 }
 
 /// A `new…Vector` that sets the named elements; elements not named keep
@@ -523,6 +542,15 @@ mod tests {
             assert_eq!(got, whole, "cut at {cut}");
         }
         assert_eq!(whole.len(), 2);
+        let blob = br#"<setBLOBVector device="CCD" name="CCD1"><oneBLOB name="CCD1" size="5" format=".fits">SGVs
+bG8s</oneBLOB></setBLOBVector>"#;
+        let mut p = Parser::default();
+        let mut got = Vec::new();
+        for part in blob.chunks(9) {
+            got.extend(p.feed(part));
+        }
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].children[0].text, "SGVs\nbG8s");
     }
 
     #[test]
