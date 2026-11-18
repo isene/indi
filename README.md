@@ -12,26 +12,33 @@ device it has.
 
 ![A camera picture with 100 stars found, HFR 1.40 px](img/screenshot-camera.png)
 
-- The devices are on the left. A green dot means the device is connected.
-- On the right is the device you picked. A focuser, a mount or a camera
-  gets a control block at the top: the focuser's position, temperature
-  and saved positions; where the mount points, how high, whether it
-  tracks, and its speed; or the camera's exposure and sensor.
-- A camera's pictures show below its block, stretched so the faint sky
-  shows, with the stars counted and their sharpness (HFR) measured. The
-  focuser's block shows the sharpest HFR so far and the position it was
-  taken at, which makes focusing a matter of making one number small.
-- Below that come all the device's settings, one group at a time, as
-  its driver defines them. The dot before each one is grey when idle,
-  green when fine, yellow when busy and red on trouble.
-- The mount goes to a planet, the Moon, any Messier or Caldwell object
-  or a named star by name, or to a star you pick on a map of tonight's
-  sky. It asks first when the target is below the horizon or near the
-  Sun, and it never points at the Sun.
-- Night colours turn everything red on black, to keep your eyes used
-  to the dark.
-- Ctrl+A opens a Claude session about the device on screen, its
-  settings and the server's messages.
+- **Devices**: every device the server has, with a green dot when it is
+  connected. All its settings show in the groups its driver defines, each
+  with a dot: grey idle, green fine, yellow busy, red trouble.
+- **Focuser**: moves of 1, 10 or 100 steps, a go-to, and nine saved
+  positions with names. It shows the sharpest HFR so far and where it
+  was taken, so focusing means making one number small.
+- **Mount**: where it points, how high, and whether it tracks. Hold an
+  arrow to move it. It goes to a planet, the Moon, a Messier or Caldwell
+  object, a named star, or a star you pick on a map of tonight's sky.
+  It asks first below the horizon or near the Sun, and never points at
+  the Sun.
+- **Camera**: exposure, cooling, gain and binning. Each picture shows in
+  real pixels where the terminal shows images, half blocks elsewhere.
+  It is stretched so the faint sky shows, and in colour from a colour
+  sensor. indi counts the stars and measures how sharp they are (HFR).
+  It takes pictures over and over, zooms to pixel size and saves FITS.
+- **Drivers**: tick them in a list and indi starts the server, and again
+  next time. It also reaches a server on another machine, such as a
+  Raspberry Pi at the telescope.
+- **Night colours**: red on black, to keep your eyes used to the dark.
+- **Claude**: Ctrl+A opens a session about the device on screen.
+- **Idle**: with no key and no news from the gear, indi does no work.
+
+indi is built on [crust](https://github.com/isene/crust), the terminal
+library of the [Fe₂O₃](https://github.com/isene/fe2o3) suite. It
+replaces the Ruby `tuindi` in
+[ruby-indi](https://github.com/isene/ruby-indi).
 
 ![The mount after a go-to to M31](img/screenshot-mount.png)
 
@@ -41,11 +48,6 @@ device it has.
 
 The pictures come from a test camera with a made-up nebula and the
 INDI simulators.
-
-indi is built on [crust](https://github.com/isene/crust), the terminal
-library of the [Fe₂O₃](https://github.com/isene/fe2o3) suite. It
-replaces the Ruby `tuindi` in
-[ruby-indi](https://github.com/isene/ruby-indi).
 
 ## Start
 
