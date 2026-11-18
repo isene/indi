@@ -10,6 +10,8 @@ indi talks to an [INDI](https://indilib.org) server, the program that
 drives focusers, mounts, cameras and filter wheels, and shows every
 device it has.
 
+![A camera picture with 100 stars found, HFR 1.40 px](img/screenshot-camera.png)
+
 - The devices are on the left. A green dot means the device is connected.
 - On the right is the device you picked. A focuser, a mount or a camera
   gets a control block at the top: the focuser's position, temperature
@@ -30,6 +32,15 @@ device it has.
   to the dark.
 - Ctrl+A opens a Claude session about the device on screen, its
   settings and the server's messages.
+
+![The mount after a go-to to M31](img/screenshot-mount.png)
+
+![The focuser with the sharpest HFR and its position](img/screenshot-focus.png)
+
+![The sky picker](img/screenshot-sky.png)
+
+The pictures come from a test camera with a made-up nebula and the
+INDI simulators.
 
 indi is built on [crust](https://github.com/isene/crust), the terminal
 library of the [Fe₂O₃](https://github.com/isene/fe2o3) suite. It

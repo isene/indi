@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 (2026-11-18)
+
+- Stars in front of a bright nebula measure as sharp as on a dark sky.
+  The nebula's glow counted as starlight and made the HFR many times
+  too large.
+- A sharp star on a colour camera is counted; it was taken for a hot
+  pixel and dropped.
+- A key typed in a prompt (go-to, focuser position) comes once. On a
+  terminal that reports key releases it came twice (crust 0.1.80).
+- The sky picker no longer keeps a core busy while it is open
+  (starmap 0.1.13, crust 0.1.80).
+- Screenshots in the README.
+
 ## 0.2.0 (2026-11-18)
 
 - A camera gets a control block, and its pictures show below it: real

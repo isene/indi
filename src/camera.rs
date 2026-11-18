@@ -326,8 +326,14 @@ impl Frame {
         let step = (gw * gh / 250_000).max(1);
         let mut s: Vec<f64> = (0..gw * gh).step_by(step).map(|k| self.light(k % gw, k / gw)).collect();
         let bg = median(&mut s);
-        let mut dev: Vec<f64> = s.iter().map(|v| (v - bg).abs()).collect();
-        let sigma = 1.4826 * median(&mut dev);
+        // The noise, from the steps between neighbours: a nebula or a
+        // sky that brightens to one side changes slowly and leaves it be.
+        let mut steps: Vec<f64> = (0..gw * gh)
+            .step_by(step)
+            .filter(|k| k % gw + 1 < gw)
+            .map(|k| (self.light(k % gw + 1, k / gw) - self.light(k % gw, k / gw)).abs())
+            .collect();
+        let sigma = 1.4826 * median(&mut steps) / std::f64::consts::SQRT_2;
         if sigma <= 0.0 {
             return;
         }
@@ -358,19 +364,38 @@ impl Frame {
         peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut kept: Vec<(usize, usize)> = Vec::new();
         let mut hfrs = Vec::new();
-        for &(_, px, py) in &peaks {
+        for &(v, px, py) in &peaks {
             if hfrs.len() >= 100 {
                 break;
             }
             if kept.iter().any(|&(x, y)| x.abs_diff(px) <= r && y.abs_diff(py) <= r) {
                 continue;
             }
+            // The sky right around it, from the edge of the box: a star on
+            // a nebula is measured against the nebula, not the dark sky,
+            // and a bump in the nebula is no star.
+            let mut edge = Vec::with_capacity(8 * r);
+            for i in 0..=2 * r {
+                edge.extend([at(px - r + i, py - r), at(px - r + i, py + r)]);
+            }
+            for i in 1..2 * r {
+                edge.extend([at(px - r, py - r + i), at(px + r, py - r + i)]);
+            }
+            let sky = median(&mut edge);
+            if v - sky < STAR_SIGMA * sigma {
+                continue;
+            }
             kept.push((px, py));
+            // Only light well above the noise and the glow around it
+            // counts: a twentieth of the peak or three times the noise. Or
+            // the noise all over the box would make every star look soft.
+            let floor = (3.0 * sigma).max(0.05 * (v - sky));
+            let light = |x: usize, y: usize| Some(at(x, y) - sky).filter(|f| *f > floor).unwrap_or(0.0);
             // The centre of the light first, then the half-flux radius.
             let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
             for y in py - r..=py + r {
                 for x in px - r..=px + r {
-                    let f = (at(x, y) - bg).max(0.0);
+                    let f = light(x, y);
                     sum += f;
                     sx += f * x as f64;
                     sy += f * y as f64;
@@ -383,13 +408,14 @@ impl Frame {
             let mut fr = 0.0;
             for y in py - r..=py + r {
                 for x in px - r..=px + r {
-                    let f = (at(x, y) - bg).max(0.0);
-                    fr += f * ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
+                    fr += light(x, y) * ((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt();
                 }
             }
             let hfr = fr / sum;
-            // A hot pixel has all its light in one place: no star.
-            if hfr > 0.7 {
+            // A hot pixel has all its light in one place: no star. A sharp
+            // star on a colour camera, read in squares of four, is not far
+            // from that, so the bar is low.
+            if hfr > 0.3 {
                 hfrs.push(hfr);
             }
         }
@@ -476,6 +502,12 @@ mod tests {
     /// A 16-bit FITS file of `w` × `h` with a background of 1000 plus a
     /// little noise, and a round star at (`sx`, `sy`).
     fn fits(w: usize, h: usize, star: Option<(f64, f64, f64)>, bayer: Option<&str>) -> Vec<u8> {
+        fits_glow(w, h, star, bayer, 0.0)
+    }
+
+    /// The same, on a broad glow `glow` bright at the middle, as a star
+    /// in a nebula.
+    fn fits_glow(w: usize, h: usize, star: Option<(f64, f64, f64)>, bayer: Option<&str>, glow: f64) -> Vec<u8> {
         let mut head = String::new();
         let mut card = |s: String| head.push_str(&format!("{s:<80}"));
         card("SIMPLE  =                    T".into());
@@ -496,6 +528,8 @@ mod tests {
             for x in 0..w {
                 seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
                 let mut v = 1000.0 + ((seed >> 16) % 20) as f64;
+                let (mx, my) = (x as f64 - w as f64 / 2.0, y as f64 - h as f64 / 2.0);
+                v += glow * (-(mx * mx + my * my) / 800.0).exp();
                 if let Some((sx, sy, sd)) = star {
                     let d2 = (x as f64 - sx).powi(2) + (y as f64 - sy).powi(2);
                     v += 30000.0 * (-d2 / (2.0 * sd * sd)).exp();
@@ -544,6 +578,22 @@ mod tests {
         assert_eq!(soft.stars, 1);
         let (a, b) = (sharp.hfr.unwrap(), soft.hfr.unwrap());
         assert!(a < b && a > 0.7, "{a} {b}");
+    }
+
+    #[test]
+    fn a_star_in_a_nebula_is_as_sharp_as_on_dark_sky() {
+        let dark = Frame::parse(fits(80, 60, Some((40.0, 30.0, 1.5)), None)).unwrap();
+        let nebula = Frame::parse(fits_glow(80, 60, Some((40.0, 30.0, 1.5)), None, 5000.0)).unwrap();
+        assert_eq!(nebula.stars, 1, "the nebula itself is no star");
+        let (a, b) = (dark.hfr.unwrap(), nebula.hfr.unwrap());
+        assert!((a - b).abs() < 0.1 * a, "dark sky {a}, nebula {b}");
+    }
+
+    #[test]
+    fn a_sharp_star_on_a_colour_camera_counts() {
+        let f = Frame::parse(fits(80, 60, Some((40.0, 30.0, 0.9)), Some("RGGB"))).unwrap();
+        assert_eq!(f.stars, 1);
+        assert!(f.hfr.unwrap() < 2.0, "{:?}", f.hfr);
     }
 
     #[test]
